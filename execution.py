@@ -1,4 +1,5 @@
 import copy
+import os
 import heapq
 import inspect
 import logging
@@ -994,7 +995,8 @@ async def validate_inputs(prompt_id, prompt, item, validated):
                         combo_options = extra_info.get("options", [])
                     else:
                         combo_options = input_type
-                    if val not in combo_options:
+                    # Allow absolute paths to bypass combo validation (for API usage)
+                    if not (isinstance(val, str) and os.path.isabs(val) and os.path.isfile(val)) and val not in combo_options:
                         input_config = info
                         list_info = ""
 

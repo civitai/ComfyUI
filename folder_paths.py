@@ -352,6 +352,10 @@ def get_full_path(folder_name: str, filename: str) -> str | None:
     """
     Get the full path of a file in a folder, has to be a file
     """
+    # Allow absolute paths directly (for API usage)
+    if os.path.isabs(filename) and os.path.isfile(filename):
+        return filename
+
     global folder_names_and_paths
     folder_name = map_legacy(folder_name)
     if folder_name not in folder_names_and_paths:
