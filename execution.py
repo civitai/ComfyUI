@@ -1,4 +1,5 @@
 import copy
+import os
 import heapq
 import inspect
 import logging
@@ -1050,10 +1051,13 @@ async def validate_inputs(prompt_id, prompt, item, validated, visiting=None):
                     else:
                         combo_options = input_type
                     is_multiselect = extra_info.get("multiselect", False)
+                    # Allow absolute paths to bypass combo validation (for API usage)
+                    def _combo_allows(v):
+                        return v in combo_options or (isinstance(v, str) and os.path.isabs(v) and os.path.isfile(v))
                     if is_multiselect and isinstance(val, list):
-                        invalid_vals = [v for v in val if v not in combo_options]
+                        invalid_vals = [v for v in val if not _combo_allows(v)]
                     else:
-                        invalid_vals = [val] if val not in combo_options else []
+                        invalid_vals = [] if _combo_allows(val) else [val]
                     if invalid_vals:
                         input_config = info
                         list_info = ""
