@@ -341,6 +341,10 @@ def is_within_directory(directory: str, target: str) -> bool:
 
 
 def get_annotated_filepath(name: str, default_dir: str | None=None) -> str:
+    # Allow absolute paths directly (for API usage)
+    if os.path.isabs(name) and os.path.isfile(name):
+        return name
+
     name, base_dir = annotated_filepath(name)
 
     if base_dir is None:
@@ -358,6 +362,10 @@ def get_annotated_filepath(name: str, default_dir: str | None=None) -> str:
 
 
 def exists_annotated_filepath(name) -> bool:
+    # Allow absolute paths directly (for API usage)
+    if os.path.isabs(name) and os.path.isfile(name):
+        return True
+
     name, base_dir = annotated_filepath(name)
 
     if base_dir is None:
