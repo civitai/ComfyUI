@@ -99,6 +99,8 @@ import comfy.text_encoders.fibo2
 import comfy.model_patcher
 import comfy.lora
 import comfy.lora_convert
+import comfy.ldm.anima.lora
+import comfy.model_base
 import comfy.hooks
 import comfy.t2i_adapter.adapter
 import comfy.taesd.taesd
@@ -115,6 +117,8 @@ def load_lora_for_models(model, clip, lora, strength_model, strength_clip, lora_
         key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, key_map)
 
     lora = comfy.lora_convert.convert_lora(lora)
+    if model is not None and isinstance(model.model, comfy.model_base.Anima):
+        lora = comfy.ldm.anima.lora.remap_lora(lora, model.model.model_config.unet_config["num_blocks"], lora_metadata)
     loaded = comfy.lora.load_lora(lora, key_map)
     if model is not None:
         new_modelpatcher = model.clone()
