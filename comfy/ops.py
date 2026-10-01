@@ -966,6 +966,18 @@ def _eager_input_act(x, input_act, act_weight=None, act_eps=0.0):
     return INPUT_ACT_EAGER[input_act](x)
 
 
+# Keep the native CUDA stream and pointer handling outside Dynamo tracing.
+@torch.library.custom_op("comfy::fp16_linear", mutates_args=())
+def fp16_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
+                residual: torch.Tensor | None = None, residual_scale: torch.Tensor | None = None) -> torch.Tensor:
+    return quant_ops.ck.fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
+
+
+@fp16_linear.register_fake
+def _fp16_linear_fake(x, weight, bias=None, residual=None, residual_scale=None):
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
 def _fp16_linear_wanted(x):
     """kitchen's fp16-accumulate GEMM replaces a plain linear when the user opted into
         fp16 accumulation and the activation is fp16 on CUDA; weights come through cast_bias_weight."""
@@ -1007,7 +1019,7 @@ def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
                 and _fp16_linear_wanted(x)):
             weight, bias, offload_stream = cast_bias_weight(linear, x, offloadable=True)
             try:
-                return quant_ops.ck.fp16_linear(
+                return fp16_linear(
                     _eager_input_act(x, input_act, act_weight, act_eps),
                     weight, bias, residual=residual, residual_scale=residual_scale)
             finally:
