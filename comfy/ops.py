@@ -1018,6 +1018,18 @@ def _linear_residual(out, residual, residual_scale):
     return out if residual is None else torch.addcmul(residual, out, residual_scale)
 
 
+# Keep the native CUDA stream and pointer handling outside Dynamo tracing.
+@torch.library.custom_op("comfy::fp16_linear", mutates_args=())
+def fp16_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
+                residual: torch.Tensor | None = None, residual_scale: torch.Tensor | None = None) -> torch.Tensor:
+    return quant_ops.ck.fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
+
+
+@fp16_linear.register_fake
+def _fp16_linear_fake(x, weight, bias=None, residual=None, residual_scale=None):
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
 def _fp16_linear_wanted(x):
     """kitchen's fp16-accumulate GEMM replaces a plain linear when the user opted into
         fp16 accumulation and the activation is fp16 on CUDA; weights come through cast_bias_weight."""
@@ -1081,7 +1093,7 @@ def linear_input_act_(x, weight, bias, input_act=None, act_weight=None, act_eps=
     if (not comfy.model_management.in_training
             and not isinstance(weight, QuantizedTensor)
             and fp16_accumulation and _fp16_linear_wanted(x)):
-        return quant_ops.ck.fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
+        return fp16_linear(x, weight, bias, residual=residual, residual_scale=residual_scale)
 
     return _linear_residual(torch.nn.functional.linear(x, weight, bias), residual, residual_scale)
 
