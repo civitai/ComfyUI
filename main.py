@@ -346,6 +346,7 @@ def prompt_worker(q, server_instance, asset_manager):
     background_scan_paused = False
 
     while True:
+        flag_completions = []
         try:
             timeout = 1000.0
             if need_gc:
@@ -392,7 +393,7 @@ def prompt_worker(q, server_instance, asset_manager):
                 else:
                     logging.info("Prompt executed in {:.2f} seconds".format(execution_time), extra={'color': 'green'})
 
-            flags = q.get_flags()
+            flags, flag_completions = q.get_flags_with_completion()
             free_memory = flags.get("free_memory", False)
 
             if flags.get("unload_models", free_memory):
@@ -407,7 +408,7 @@ def prompt_worker(q, server_instance, asset_manager):
 
             if need_gc:
                 current_time = time.perf_counter()
-                if (current_time - last_gc_collect) > gc_collect_interval:
+                if flags or (current_time - last_gc_collect) > gc_collect_interval:
                     gc.collect()
                     comfy.model_management.soft_empty_cache()
                     last_gc_collect = current_time
@@ -417,9 +418,17 @@ def prompt_worker(q, server_instance, asset_manager):
                     asset_manager.queue_output_scan()
                     asset_manager.resume_background_scan()
                     background_scan_paused = False
+
+            # Cancelling a waiter must not cancel cleanup or another waiter.
+            for completion in flag_completions:
+                if completion.set_running_or_notify_cancel():
+                    completion.set_result(None)
         # BaseException is deliberate. This runs on the worker thread, so Ctrl-C lands in
         # the main thread instead, and resume only flips the seeder's pause state.
-        except BaseException:
+        except BaseException as error:
+            for completion in flag_completions:
+                if completion.set_running_or_notify_cancel():
+                    completion.set_exception(error)
             if background_scan_paused:
                 try:
                     asset_manager.resume_background_scan()

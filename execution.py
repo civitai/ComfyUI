@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import Future
 from enum import Enum
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import asyncio
@@ -1307,6 +1308,7 @@ class PromptQueue:
         self.currently_running = {}
         self.history = {}
         self.flags = {}
+        self.flag_completions = []
 
     def put(self, item):
         with self.mutex:
@@ -1316,10 +1318,9 @@ class PromptQueue:
 
     def get(self, timeout=None):
         with self.not_empty:
-            while len(self.queue) == 0:
-                self.not_empty.wait(timeout=timeout)
-                if timeout is not None and len(self.queue) == 0:
-                    return None
+            self.not_empty.wait_for(lambda: self.queue or self.flags, timeout=timeout)
+            if self.flags or not self.queue:
+                return None
             item = heapq.heappop(self.queue)
             i = self.task_counter
             self.currently_running[i] = copy.deepcopy(item)
@@ -1449,6 +1450,23 @@ class PromptQueue:
         with self.mutex:
             self.flags[name] = data
             self.not_empty.notify()
+
+    def set_flags(self, flags):
+        """Submit flags atomically and return their worker completion."""
+        with self.mutex:
+            self.flags.update(flags)
+            completion = Future()
+            self.flag_completions.append(completion)
+            self.not_empty.notify()
+            return completion
+
+    def get_flags_with_completion(self):
+        """Take one batch without acknowledging flags submitted during its cleanup."""
+        with self.mutex:
+            flags = self.get_flags()
+            completions = self.flag_completions
+            self.flag_completions = []
+            return flags, completions
 
     def get_flags(self, reset=True):
         with self.mutex:

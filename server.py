@@ -1202,10 +1202,25 @@ class PromptServer():
             json_data = await request.json()
             unload_models = json_data.get("unload_models", False)
             free_memory = json_data.get("free_memory", False)
+            wait = json_data.get("wait", False)
+            if not isinstance(wait, bool):
+                return web.json_response({"error": "wait must be a boolean"}, status=400)
+            if wait:
+                timeout = json_data.get("timeout", 30)
+                if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 300:
+                    return web.json_response({"error": "timeout must be a number greater than 0 and at most 300 seconds"}, status=400)
+            flags = {}
             if unload_models:
-                self.prompt_queue.set_flag("unload_models", unload_models)
+                flags["unload_models"] = unload_models
             if free_memory:
-                self.prompt_queue.set_flag("free_memory", free_memory)
+                flags["free_memory"] = free_memory
+            if flags:
+                completion = self.prompt_queue.set_flags(flags)
+                if wait:
+                    try:
+                        await asyncio.wait_for(asyncio.wrap_future(completion), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        return web.json_response({"error": "Timed out waiting for model cleanup"}, status=504)
             return web.Response(status=200)
 
         @routes.post("/history")
