@@ -1,5 +1,6 @@
 import pytest
 import torch
+from unittest.mock import Mock
 
 from comfy.cli_args import args
 
@@ -49,8 +50,8 @@ class Queue:
             raise self.completion_error
         self.running = 0
 
-    def get_flags(self):
-        return {}
+    def get_flags_with_completion(self):
+        return {}, []
 
 
 class Server:
@@ -155,3 +156,91 @@ def test_prompt_worker_resumes_scan_once_the_queue_is_empty(monkeypatch) -> None
 
 def test_prompt_worker_keeps_scan_paused_while_prompts_are_queued(monkeypatch) -> None:
     assert _paused_when_the_worker_asks_for_the_next_prompt(monkeypatch, queued_after_first=1) == [True]
+
+
+@pytest.mark.parametrize("failed_stage", [None, "unload", "reset", "gc", "empty_cache"])
+def test_free_completion_follows_all_cleanup(monkeypatch, failed_stage):
+    queue = main.execution.PromptQueue(Mock())
+    completion = queue.set_flags({"unload_models": True, "free_memory": True})
+    events = []
+
+    def stage(name):
+        def run(*args, **kwargs):
+            assert not completion.done()
+            events.append(name)
+            if name == failed_stage:
+                raise RuntimeError(name)
+        return run
+
+    class FreeExecutor(Executor):
+        reset = stage("reset")
+
+    original_get = queue.get
+    calls = 0
+
+    def get(timeout=None):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise LoopEscape()
+        return original_get(timeout=0)
+
+    monkeypatch.setattr(queue, "get", get)
+    monkeypatch.setattr(main.execution, "PromptExecutor", FreeExecutor)
+    monkeypatch.setattr(main.comfy.model_management, "unload_all_models", stage("unload"))
+    monkeypatch.setattr(main.gc, "collect", stage("gc"))
+    monkeypatch.setattr(main.comfy.model_management, "soft_empty_cache", stage("empty_cache"))
+    monkeypatch.setattr(main.hook_breaker_ac10a0, "restore_functions", stage("restore"))
+    # Explicit cleanup must not wait for the periodic ten-second GC interval.
+    monkeypatch.setattr(main.time, "perf_counter", lambda: 1.0)
+
+    if failed_stage:
+        with pytest.raises(RuntimeError, match=f"^{failed_stage}$"):
+            main.prompt_worker(queue, Server(), Mock())
+        with pytest.raises(RuntimeError, match=f"^{failed_stage}$"):
+            completion.result(timeout=0)
+    else:
+        with pytest.raises(LoopEscape):
+            main.prompt_worker(queue, Server(), Mock())
+        assert completion.result(timeout=0) is None
+        assert events == ["unload", "reset", "gc", "empty_cache", "restore"]
+
+
+def test_free_requested_during_prompt_completes_after_execution(monkeypatch):
+    queue = main.execution.PromptQueue(Mock())
+    queue.put((0, "prompt-id", {}, {}, [], {}))
+    completion = None
+    events = []
+
+    class BusyExecutor(Executor):
+        def execute(self, *args, **kwargs):
+            nonlocal completion
+            events.append("execute")
+            completion = queue.set_flags({"free_memory": True})
+            assert not completion.done()
+            events.append("executed")
+
+        def reset(self):
+            events.append("reset")
+
+    original_get = queue.get
+    calls = 0
+
+    def get(timeout=None):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise LoopEscape()
+        return original_get(timeout=0)
+
+    monkeypatch.setattr(queue, "get", get)
+    monkeypatch.setattr(main.execution, "PromptExecutor", BusyExecutor)
+    monkeypatch.setattr(main.comfy.model_management, "unload_all_models", lambda: events.append("unload"))
+    monkeypatch.setattr(main.gc, "collect", lambda: events.append("gc"))
+    monkeypatch.setattr(main.comfy.model_management, "soft_empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(main.hook_breaker_ac10a0, "restore_functions", lambda: None)
+
+    with pytest.raises(LoopEscape):
+        main.prompt_worker(queue, Server(), Mock())
+    assert events == ["execute", "executed", "unload", "reset", "gc", "empty_cache"]
+    assert completion.result(timeout=0) is None
