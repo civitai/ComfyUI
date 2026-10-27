@@ -1,8 +1,10 @@
 import math
 import nodes
+import folder_paths
 import node_helpers
 import torch
 import comfy.model_management
+import comfy.sd
 import comfy.utils
 import comfy.latent_formats
 import comfy.clip_vision
@@ -14,6 +16,35 @@ from typing import Tuple, TypedDict
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 import logging
+
+class WanLoraLoader(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="WanLoraLoader",
+            category="model/loaders",
+            inputs=[
+                io.Model.Input("model"),
+                io.Combo.Input("lora_name", options=folder_paths.get_filename_list("loras")),
+                io.Float.Input("strength_model", default=1.0, min=-100.0, max=100.0, step=0.01),
+                io.Combo.Input("stage", options=["high_noise", "low_noise"]),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, lora_name, strength_model, stage) -> io.NodeOutput:
+        if strength_model == 0:
+            return io.NodeOutput(model)
+        prefix = {"high_noise": "diffusion_model.transformer_1.", "low_noise": "diffusion_model.transformer_2."}[stage]
+        path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora, metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+        if any(key.startswith(("diffusion_model.transformer_1.", "diffusion_model.transformer_2.")) for key in lora):
+            lora = {"diffusion_model." + key[len(prefix):]: value for key, value in lora.items() if key.startswith(prefix)}
+            if not lora:
+                raise ValueError(f"Wan LoRA has no {stage} weights")
+        patched, _ = comfy.sd.load_lora_for_models(model, None, lora, strength_model, 0, lora_metadata=metadata)
+        return io.NodeOutput(patched)
 
 class WanImageToVideo(io.ComfyNode):
     @classmethod
@@ -1628,6 +1659,7 @@ class WanExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
+            WanLoraLoader,
             WanTrackToVideo,
             WanImageToVideo,
             WanFunControlToVideo,
