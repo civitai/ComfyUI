@@ -165,7 +165,7 @@ class TextFusionTransformer(nn.Module):
         for block in self.layerwise_blocks:
             x = block(x.contiguous(), mask=None, transformer_options=transformer_options, compute_dtype=compute_dtype)
         x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
-        x = self.projector(x.to(compute_dtype)).squeeze(-1)
+        x = self.projector(x).squeeze(-1)
         for block in self.refiner_blocks:
             x = block(x, mask=mask, transformer_options=transformer_options, compute_dtype=compute_dtype)
         return x
@@ -180,7 +180,9 @@ class SingleStreamBlock(nn.Module):
         self.attn = Attention(features, heads, kvheads=kvheads, bias=bias, device=device, dtype=dtype, operations=operations)
         self.mlp = SwiGLU(features, multiplier, bias, device=device, dtype=dtype, operations=operations)
 
-    def forward(self, x, vec, freqs, mask=None, timestep_zero_index=None, transformer_options={}):
+    def forward(self, x, vec, freqs, mask=None, timestep_zero_index=None, transformer_options={}, compute_dtype=None):
+        if compute_dtype is None:
+            compute_dtype = x.dtype
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         if timestep_zero_index is not None:
             bs = x.shape[0]
@@ -197,29 +199,31 @@ class SingleStreamBlock(nn.Module):
             postshift = postshift[:bs]
             postgate = postgate[:bs]
 
-            pre = self.prenorm(x)
+            pre = self.prenorm(x).to(compute_dtype)
             pre[:, :timestep_zero_index].mul_(1 + prescale).add_(preshift)
             pre[:, timestep_zero_index:].mul_(1 + ref_prescale).add_(ref_preshift)
             attn = self.attn(pre, freqs, mask, transformer_options=transformer_options)
             del pre
+            attn = attn.to(x.dtype)
             attn[:, :timestep_zero_index].mul_(pregate)
             attn[:, timestep_zero_index:].mul_(ref_pregate)
             x = x + attn
             del attn
 
-            post = self.postnorm(x)
+            post = self.postnorm(x).to(compute_dtype)
             post[:, :timestep_zero_index].mul_(1 + postscale).add_(postshift)
             post[:, timestep_zero_index:].mul_(1 + ref_postscale).add_(ref_postshift)
             mlp = self.mlp(post)
             del post
+            mlp = mlp.to(x.dtype)
             mlp[:, :timestep_zero_index].mul_(postgate)
             mlp[:, timestep_zero_index:].mul_(ref_postgate)
             x = x + mlp
             del mlp
             return x
 
-        x = x + pregate * self.attn((1 + prescale) * self.prenorm(x) + preshift, freqs, mask, transformer_options=transformer_options)
-        x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+        x = torch.addcmul(x, pregate, self.attn((1 + prescale) * self.prenorm(x).to(compute_dtype) + preshift, freqs, mask, transformer_options=transformer_options))
+        x = torch.addcmul(x, postgate, self.mlp((1 + postscale) * self.postnorm(x).to(compute_dtype) + postshift))
         return x
 
 
@@ -230,9 +234,11 @@ class LastLayer(nn.Module):
         self.linear = operations.Linear(features, patch * patch * channels, bias=True, device=device, dtype=dtype)
         self.modulation = SimpleModulation(features, device=device, dtype=dtype, operations=operations)
 
-    def forward(self, x, tvec):
+    def forward(self, x, tvec, compute_dtype=None):
+        if compute_dtype is None:
+            compute_dtype = x.dtype
         scale, shift = self.modulation(tvec)
-        x = (1 + scale) * self.norm(x) + shift
+        x = (1 + scale) * self.norm(x).to(compute_dtype) + shift
         return self.linear(x)
 
 
@@ -359,6 +365,10 @@ class SingleStreamDiT(nn.Module):
                 imgpos, txtpos = out["img_ids"], out["txt_ids"]
 
         combined = torch.cat((context, img), dim=1)
+        compute_dtype = combined.dtype
+        # Keep gated residuals in range until normalization without upcasting the attention or MLP.
+        if compute_dtype == torch.float16:
+            combined = combined.float()
         del context, img
         if timestep_zero_index is not None:
             timestep_zero_index += txtlen
@@ -375,9 +385,9 @@ class SingleStreamDiT(nn.Module):
         transformer_options["img_slice"] = [txtlen, combined.shape[1]]
         for i, block in enumerate(self.blocks):
             transformer_options["block_index"] = i
-            combined = block(combined, tvec, freqs, None, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options)
+            combined = block(combined, tvec, freqs, None, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options, compute_dtype=compute_dtype)
 
-        final = self.last(combined, t)
+        final = self.last(combined, t, compute_dtype=compute_dtype)
         del combined
         out = final[:, txtlen:txtlen + img_tokens, :]
         out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
