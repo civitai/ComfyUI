@@ -135,9 +135,13 @@ class TextFusionBlock(nn.Module):
         self.attn = Attention(features, heads, kvheads=kvheads, bias=bias, device=device, dtype=dtype, operations=operations)
         self.mlp = SwiGLU(features, multiplier, bias, device=device, dtype=dtype, operations=operations)
 
-    def forward(self, x, mask=None, transformer_options={}):
-        x = x + self.attn(self.prenorm(x), mask=mask, transformer_options=transformer_options)
-        x = x + self.mlp(self.postnorm(x))
+    def forward(self, x, mask=None, transformer_options={}, compute_dtype=None):
+        if compute_dtype is None:
+            compute_dtype = x.dtype
+        # Keep the residual in range until normalization, while the projections stay in the model dtype.
+        residual = x.float() if compute_dtype == torch.float16 else x
+        x = residual + self.attn(self.prenorm(x).to(compute_dtype), mask=mask, transformer_options=transformer_options)
+        x = x + self.mlp(self.postnorm(x).to(compute_dtype))
         return x
 
 
@@ -155,14 +159,15 @@ class TextFusionTransformer(nn.Module):
         ])
 
     def forward(self, x, mask=None, transformer_options={}):
+        compute_dtype = x.dtype
         b, l, n, d = x.shape
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
-            x = block(x.contiguous(), mask=None, transformer_options=transformer_options)
+            x = block(x.contiguous(), mask=None, transformer_options=transformer_options, compute_dtype=compute_dtype)
         x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
-        x = self.projector(x).squeeze(-1)
+        x = self.projector(x.to(compute_dtype)).squeeze(-1)
         for block in self.refiner_blocks:
-            x = block(x, mask=mask, transformer_options=transformer_options)
+            x = block(x, mask=mask, transformer_options=transformer_options, compute_dtype=compute_dtype)
         return x
 
 
@@ -339,7 +344,8 @@ class SingleStreamDiT(nn.Module):
             tvec = torch.cat((tvec, self.tproj(t0)), dim=0)
 
         context = self.txtfusion(context, mask=None, transformer_options=transformer_options)
-        context = self.txtmlp(context)
+        context = self.txtmlp[0](context).to(img.dtype)
+        context = self.txtmlp[1:](context)
 
         txtlen = context.shape[1]
         device = context.device
